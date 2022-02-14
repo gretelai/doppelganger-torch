@@ -5,4 +5,8 @@ torch==1.10.2
 tqdm==4.62.3
 pytest==7.0.1
 # Remove after bumping torch to release that fixes https://github.com/pytorch/pytorch/issues/69894
-setuptools<59.6.0  
+setuptools<59.6.0
+
+# For jupyter notebook
+jupyter==1.0.0
+pandas==1.4.1
