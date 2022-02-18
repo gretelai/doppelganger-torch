@@ -459,11 +459,15 @@ class Merger(torch.nn.Module):
 
     def __init__(self, modules, dim_index: int):
         super(Merger, self).__init__()
-        self.modules = modules
+        if isinstance(modules, torch.nn.ModuleList):
+            self.layers = modules
+        else:
+            self.layers = torch.nn.ModuleList(modules)
+
         self.dim_index = dim_index
 
     def forward(self, input):
-        return torch.cat([m(input) for m in self.modules], dim=self.dim_index)
+        return torch.cat([m(input) for m in self.layers], dim=self.dim_index)
 
 
 class OutputDecoder(torch.nn.Module):
