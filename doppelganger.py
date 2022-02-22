@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Union
@@ -483,10 +484,10 @@ class OutputDecoder(torch.nn.Module):
         for output in outputs:
             if "DiscreteOutput" in str(output.__class__):
                 self.generators.append(
-                    torch.nn.Sequential(
-                        torch.nn.Linear(input_dim, output.get_dim()),
-                        torch.nn.Softmax(dim=dim_index),
-                    )
+                    torch.nn.Sequential(OrderedDict([
+                        ("linear", torch.nn.Linear(input_dim, output.get_dim())),
+                        ("softmax", torch.nn.Softmax(dim=dim_index)),
+                    ]))
                 )
             elif "ContinuousOutput" in str(output.__class__):
                 if output.normalization == Normalization.ZERO_ONE:
@@ -498,9 +499,10 @@ class OutputDecoder(torch.nn.Module):
                         f"Unsupported normalization='{output.normalization}'"
                     )
                 self.generators.append(
-                    torch.nn.Sequential(
-                        torch.nn.Linear(input_dim, output.get_dim()), normalizer
-                    )
+                    torch.nn.Sequential(OrderedDict([
+                        ("linear", torch.nn.Linear(input_dim, output.get_dim())),
+                        ("normalization", normalizer),
+                    ]))
                 )
             else:
                 raise RuntimeError(f"Unsupported output type, class={type(output)}'")
@@ -566,22 +568,18 @@ class Generator(torch.nn.Module):
             self.additional_attribute_gen = None
             additional_attribute_dim = 0
 
-        seq = [
-            torch.nn.LSTM(
-                attribute_dim + additional_attribute_dim + feature_noise_dim,
-                feature_num_units,
-                feature_num_layers,
-            ),
-            SelectLastCell(),
-            Merger(
+        self.feature_gen = torch.nn.Sequential(OrderedDict([
+            ("lstm", torch.nn.LSTM(attribute_dim + additional_attribute_dim + feature_noise_dim,
+            feature_num_units, feature_num_layers)),
+            ("selector", SelectLastCell()),
+            ("merger", Merger(
                 [
                     OutputDecoder(feature_num_units, feature_outputs, dim_index=2)
                     for _ in range(self.sample_len)
                 ],
                 dim_index=2,
-            ),
-        ]
-        self.feature_gen = torch.nn.Sequential(*seq)
+            )),
+        ]))
 
     def _make_attribute_generator(
         self, outputs: List[Output], input_dim: int, num_units: int, num_layers: int
@@ -677,6 +675,24 @@ def interpolate(x1, x2, alpha):
 
     return x1 + reshaped_alpha * diff
 
+def apply_named(m: torch.nn.Module, prefix: str, func):
+    """Equivalent to Module.apply, but also provides access to the submodule names.
+    """
+    func(m, prefix)
+
+    for name, child in m.named_children():
+        apply_named(child, prefix + "." + name, func)
+
+def log_weights(m: torch.nn.Module, tb_writer: tensorboard.SummaryWriter, global_step):
+    """Log weight histograms to tensorboard.
+
+    Parameters for m and all children will be logged to tensorboard, including
+    submodule names as prefixes to distinguish different layers.
+    """
+    def f(a, prefix):
+        for name, param in a.named_parameters(recurse=False):
+            tb_writer.add_histogram("weights/" + prefix + "." + name, param, global_step)
+    apply_named(m, "", f)
 
 class DGTorch:
     """
@@ -956,31 +972,47 @@ class DGTorch:
             betas=(self.generator_beta1, 0.999),
         )
 
-        global_step = 0
-
-        if log_activations and tb_writer is not None:
-
-            def log_activations_func(tb: tensorboard.SummaryWriter):
-                def hook(model, input, output):
-                    def process(x, prefix):
-                        if isinstance(x, torch.Tensor):
-                            # TODO: better way to get global step?
-                            tb.add_histogram(prefix, x, global_step)
-                        elif isinstance(x, tuple):
-                            for index, e in enumerate(x):
-                                process(e, prefix + "_" + str(index))
-                        else:
-                            print(f"unknown input type={type(x)}")
-
-                    process(output, "activations/" + str(model.__class__))
-
-                return hook
-
-            self.generator.apply(
-                lambda module: module.register_forward_hook(
-                    log_activations_func(tb_writer)
-                )
+        if tb_writer is not None:
+            tb_writer.add_graph(
+                self.generator,
+                (
+                    self.attribute_noise_func(batch_size).detach(),
+                    self.feature_noise_func(batch_size).detach(),
+                ),
             )
+
+        global_step = 0
+        if log_activations and tb_writer is not None:
+            # Add forward and backward hooks to log activations and gradients to
+            # tensorbord.
+            def process_nested(x, prefix, func):
+                if isinstance(x, torch.Tensor):
+                    func(x, prefix)
+                elif isinstance(x, tuple):
+                    for index, e in enumerate(x):
+                        process_nested(e, "{}_{}".format(prefix, index), func)
+                elif x is None:
+                    pass
+                else:
+                    print(f"Unknown input type={type(x)} for process_nested")
+
+            def log_activations_and_gradients(m, prefix):
+                def add_activations(t, p):
+                    tb_writer.add_histogram(p, t, global_step)
+                def add_gradients(t, p):
+                    tb_writer.add_histogram(p, t, global_step)
+                    tb_writer.add_scalar(p + "_norm", t.norm(2), global_step)
+
+                def forward_hook(model, input, output):
+                    process_nested(output, "activations/" + prefix, add_activations)
+
+                def backward_hook(model, grad_input, grad_output):
+                    process_nested(grad_output, "gradients/" + prefix, add_gradients)
+
+                m.register_forward_hook(forward_hook)
+                m.register_full_backward_hook(backward_hook)
+
+            apply_named(self.generator, "", log_activations_and_gradients)
 
         if forget_bias:
             for m in self.generator.feature_gen.children():
@@ -1003,11 +1035,7 @@ class DGTorch:
             # attributes are present
 
             if tb_writer is not None:
-                for m in self.generator.feature_gen.children():
-                    for name, param in m.named_parameters():
-                        tb_writer.add_histogram(
-                            "weights/" + str(m.__class__) + "_" + name, param, epoch
-                        )
+                log_weights(self.generator, tb_writer, epoch)
 
             for batch_number, real_batch in tqdm(enumerate(loader)):
                 global_step += 1
@@ -1164,6 +1192,9 @@ class DGTorch:
                 tb_writer.add_figure(
                     "generated/autocovariance", figs, global_step=epoch, close=True
                 )
+
+        if tb_writer is not None:
+            log_weights(self.generator, tb_writer, num_epochs)
 
         if tb_writer is not None:
             tb_writer.flush()
