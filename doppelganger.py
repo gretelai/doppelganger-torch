@@ -722,7 +722,14 @@ class DGTorch:
         attribute_loss_coef: float = 1.0,
         attribute_discriminator_learning_rate: float = 0.001,
         attribute_discriminator_beta1: float = 0.5,
+        forget_bias: bool = False,
     ):
+        """
+        Args:
+            forget_bias: if True, initialize forget gate bias to 1 in LSTM
+                layers, otherwise use default pytorch initialization.
+                forget_bias=True mimics tf1 LSTMCell behavior.
+        """
         if max_sequence_len % sample_len != 0:
             raise RuntimeError(
                 f"max_sequence_len={max_sequence_len} must be divisible by sample_len={sample_len}"
@@ -788,6 +795,33 @@ class DGTorch:
         self.feature_noise_func = lambda batch_size: torch.randn(
             batch_size, max_sequence_len // sample_len, feature_noise_dim
         )
+
+        if forget_bias:
+            def init_weights(m):
+                if "LSTM" in str(m.__class__):
+                    for name, param in m.named_parameters(recurse=False):
+                        if "bias_hh" in name:
+                            # The LSTM bias param is a concatenation of 4 bias
+                            # terms: (b_ii|b_if|b_ig|b_io). We only want to
+                            # change the forget gate bias, i.e., b_if. But we
+                            # can't change a slice of the tensor, so need to
+                            # recreate the initialization for the other parts
+                            # and concatenate with the new forget gate bias
+                            # initialization.
+                            with torch.no_grad():
+                                hidden_size = m.hidden_size
+                                a = -np.sqrt(1.0 / hidden_size)
+                                b = np.sqrt(1.0 / hidden_size)
+                                bias_ii = torch.Tensor(hidden_size)
+                                bias_ig_io = torch.Tensor(hidden_size * 2)
+                                bias_if = torch.Tensor(hidden_size)
+                                torch.nn.init.uniform_(bias_ii, a, b)
+                                torch.nn.init.uniform_(bias_ig_io, a, b)
+                                torch.nn.init.ones_(bias_if)
+                                new_param = torch.cat([bias_ii, bias_if, bias_ig_io], dim=0)
+                                param.copy_(new_param)
+
+            self.generator.apply(init_weights)
 
     def generate(
         self, batch_size: int = None, attribute_noise=None, feature_noise=None
@@ -943,7 +977,6 @@ class DGTorch:
         generator_rounds: int = 1,
         tb_writer: tensorboard.SummaryWriter = None,
         log_activations: bool = False,
-        forget_bias: bool = True,
     ):
         # TODO: performance, cpu/gpu, pinning memory
 
@@ -1013,17 +1046,6 @@ class DGTorch:
                 m.register_full_backward_hook(backward_hook)
 
             apply_named(self.generator, "", log_activations_and_gradients)
-
-        if forget_bias:
-            for m in self.generator.feature_gen.children():
-                if "LSTM" in str(m.__class__):
-                    for name, param in m.named_parameters():
-                        if "bias" in name:
-                            # param is concatenation of 4 bias terms
-                            # (b_ii|b_if|b_ig|b_io). We just want to change the
-                            # forget gate bias, ie the f part.
-                            # TODO: change only the forget biases
-                            torch.nn.init.normal_(param, 0.5, 0.02)
 
         # TODO: can we detach for no gradient tracking for lots of stuff like
         # noise creation, generator when computing discriminator loss, etc.,
