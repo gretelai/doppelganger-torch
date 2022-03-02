@@ -569,8 +569,7 @@ class Generator(torch.nn.Module):
             additional_attribute_dim = 0
 
         self.feature_gen = torch.nn.Sequential(OrderedDict([
-            ("lstm", torch.nn.LSTM(attribute_dim + additional_attribute_dim + feature_noise_dim,
-            feature_num_units, feature_num_layers)),
+            ("lstm", torch.nn.LSTM(attribute_dim + additional_attribute_dim + feature_noise_dim, feature_num_units, feature_num_layers, batch_first=True)),
             ("selector", SelectLastCell()),
             ("merger", Merger(
                 [
