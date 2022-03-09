@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 def autocovariance(a):
     """Compute autocovariance of multiple time series.
-    
+
     Args:
 
         a: Time series with 1 channel. Accepts 2-d numpy array of examples x
@@ -77,7 +77,6 @@ class Output:
     # TODO: better way to always have dim=1 in ContinuousOutput?
     def get_dim(self):
         return 1
-
 
 
 @dataclass(frozen=True)
@@ -473,6 +472,7 @@ class Merger(torch.nn.Module):
 
 class OutputDecoder(torch.nn.Module):
     """Decoder to produce continuous or discrete output values as needed."""
+
     def __init__(self, input_dim: int, outputs: List[Output], dim_index: int):
         super(OutputDecoder, self).__init__()
         if outputs is None or len(outputs) == 0:
@@ -484,10 +484,17 @@ class OutputDecoder(torch.nn.Module):
         for output in outputs:
             if "DiscreteOutput" in str(output.__class__):
                 self.generators.append(
-                    torch.nn.Sequential(OrderedDict([
-                        ("linear", torch.nn.Linear(input_dim, output.get_dim())),
-                        ("softmax", torch.nn.Softmax(dim=dim_index)),
-                    ]))
+                    torch.nn.Sequential(
+                        OrderedDict(
+                            [
+                                (
+                                    "linear",
+                                    torch.nn.Linear(input_dim, output.get_dim()),
+                                ),
+                                ("softmax", torch.nn.Softmax(dim=dim_index)),
+                            ]
+                        )
+                    )
                 )
             elif "ContinuousOutput" in str(output.__class__):
                 if output.normalization == Normalization.ZERO_ONE:
@@ -499,10 +506,17 @@ class OutputDecoder(torch.nn.Module):
                         f"Unsupported normalization='{output.normalization}'"
                     )
                 self.generators.append(
-                    torch.nn.Sequential(OrderedDict([
-                        ("linear", torch.nn.Linear(input_dim, output.get_dim())),
-                        ("normalization", normalizer),
-                    ]))
+                    torch.nn.Sequential(
+                        OrderedDict(
+                            [
+                                (
+                                    "linear",
+                                    torch.nn.Linear(input_dim, output.get_dim()),
+                                ),
+                                ("normalization", normalizer),
+                            ]
+                        )
+                    )
                 )
             else:
                 raise RuntimeError(f"Unsupported output type, class={type(output)}'")
@@ -568,17 +582,36 @@ class Generator(torch.nn.Module):
             self.additional_attribute_gen = None
             additional_attribute_dim = 0
 
-        self.feature_gen = torch.nn.Sequential(OrderedDict([
-            ("lstm", torch.nn.LSTM(attribute_dim + additional_attribute_dim + feature_noise_dim, feature_num_units, feature_num_layers, batch_first=True)),
-            ("selector", SelectLastCell()),
-            ("merger", Merger(
+        self.feature_gen = torch.nn.Sequential(
+            OrderedDict(
                 [
-                    OutputDecoder(feature_num_units, feature_outputs, dim_index=2)
-                    for _ in range(self.sample_len)
-                ],
-                dim_index=2,
-            )),
-        ]))
+                    (
+                        "lstm",
+                        torch.nn.LSTM(
+                            attribute_dim
+                            + additional_attribute_dim
+                            + feature_noise_dim,
+                            feature_num_units,
+                            feature_num_layers,
+                            batch_first=True,
+                        ),
+                    ),
+                    ("selector", SelectLastCell()),
+                    (
+                        "merger",
+                        Merger(
+                            [
+                                OutputDecoder(
+                                    feature_num_units, feature_outputs, dim_index=2
+                                )
+                                for _ in range(self.sample_len)
+                            ],
+                            dim_index=2,
+                        ),
+                    ),
+                ]
+            )
+        )
 
     def _make_attribute_generator(
         self, outputs: List[Output], input_dim: int, num_units: int, num_layers: int
@@ -674,13 +707,14 @@ def interpolate(x1, x2, alpha):
 
     return x1 + reshaped_alpha * diff
 
+
 def apply_named(m: torch.nn.Module, prefix: str, func):
-    """Equivalent to Module.apply, but also provides access to the submodule names.
-    """
+    """Equivalent to Module.apply, but also provides access to the submodule names."""
     func(m, prefix)
 
     for name, child in m.named_children():
         apply_named(child, prefix + "." + name, func)
+
 
 def log_weights(m: torch.nn.Module, tb_writer: tensorboard.SummaryWriter, global_step):
     """Log weight histograms to tensorboard.
@@ -688,10 +722,15 @@ def log_weights(m: torch.nn.Module, tb_writer: tensorboard.SummaryWriter, global
     Parameters for m and all children will be logged to tensorboard, including
     submodule names as prefixes to distinguish different layers.
     """
+
     def f(a, prefix):
         for name, param in a.named_parameters(recurse=False):
-            tb_writer.add_histogram("weights/" + prefix + "." + name, param, global_step)
+            tb_writer.add_histogram(
+                "weights/" + prefix + "." + name, param, global_step
+            )
+
     apply_named(m, "", f)
+
 
 class DGTorch:
     """
@@ -796,6 +835,7 @@ class DGTorch:
         )
 
         if forget_bias:
+
             def init_weights(m):
                 if "LSTM" in str(m.__class__):
                     for name, param in m.named_parameters(recurse=False):
@@ -817,7 +857,9 @@ class DGTorch:
                                 torch.nn.init.uniform_(bias_ii, a, b)
                                 torch.nn.init.uniform_(bias_ig_io, a, b)
                                 torch.nn.init.ones_(bias_if)
-                                new_param = torch.cat([bias_ii, bias_if, bias_ig_io], dim=0)
+                                new_param = torch.cat(
+                                    [bias_ii, bias_if, bias_ig_io], dim=0
+                                )
                                 param.copy_(new_param)
 
             self.generator.apply(init_weights)
@@ -909,7 +951,6 @@ class DGTorch:
         norm = torch.sqrt(sum(squared_sums) + self.EPS)
 
         return ((norm - 1.0) ** 2).mean()
-
 
     def add_batch_summary(
         self, tb_writer: tensorboard.SummaryWriter, batch, prefix: str, global_step: int
@@ -1031,6 +1072,7 @@ class DGTorch:
             def log_activations_and_gradients(m, prefix):
                 def add_activations(t, p):
                     tb_writer.add_histogram(p, t, global_step)
+
                 def add_gradients(t, p):
                     tb_writer.add_histogram(p, t, global_step)
                     tb_writer.add_scalar(p + "_norm", t.norm(2), global_step)
@@ -1133,7 +1175,6 @@ class DGTorch:
                             + self.attribute_gradient_penalty_coef
                             * loss_gradient_penalty
                         )
-
 
                         if tb_writer is not None:
                             tb_writer.add_scalar(
