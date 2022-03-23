@@ -761,12 +761,14 @@ class DGTorch:
         attribute_discriminator_learning_rate: float = 0.001,
         attribute_discriminator_beta1: float = 0.5,
         forget_bias: bool = False,
+        cuda: bool = True,
     ):
         """
         Args:
             forget_bias: if True, initialize forget gate bias to 1 in LSTM
                 layers, otherwise use default pytorch initialization.
                 forget_bias=True mimics tf1 LSTMCell behavior.
+            cuda: if True, uses GPU if available, defaults to True
         """
         if max_sequence_len % sample_len != 0:
             raise RuntimeError(
@@ -789,6 +791,11 @@ class DGTorch:
         )
         self.attribute_discriminator_beta1 = attribute_discriminator_beta1
 
+        if cuda and torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+
         self.generator = Generator(
             attribute_outputs,
             additional_attribute_outputs,
@@ -802,6 +809,7 @@ class DGTorch:
             feature_num_units,
             feature_num_layers,
         )
+        self.generator.to(self.device)
 
         # TODO: get dims from generator instead of assuming internal details.
         attribute_dim = sum(output.get_dim() for output in attribute_outputs)
@@ -817,6 +825,7 @@ class DGTorch:
             num_layers=5,
             num_units=200,
         )
+        self.feature_discriminator.to(self.device)
 
         self.attribute_discriminator = None
         if use_attribute_discriminator:
@@ -825,13 +834,17 @@ class DGTorch:
                 num_layers=5,
                 num_units=200,
             )
+            self.attribute_discriminator.to(self.device)
 
         self.attribute_noise_func = lambda batch_size: torch.randn(
-            batch_size, attribute_noise_dim
+            batch_size, attribute_noise_dim, device=self.device
         )
         # TODO: add additional attribute noise func
         self.feature_noise_func = lambda batch_size: torch.randn(
-            batch_size, max_sequence_len // sample_len, feature_noise_dim
+            batch_size,
+            max_sequence_len // sample_len,
+            feature_noise_dim,
+            device=self.device,
         )
 
         if forget_bias:
@@ -876,10 +889,12 @@ class DGTorch:
                 raise RuntimeError(
                     "generate() must receive either batch_size or both attribute_noise and feature_noise"
                 )
+            attribute_noise = attribute_noise.to(self.device)
+            feature_noise = feature_noise.to(self.device)
 
         batch = self.generator(attribute_noise, feature_noise)
 
-        batch = [x.detach().numpy() for x in batch]
+        batch = [x.cpu().detach().numpy() for x in batch]
         if self.additional_attribute_outputs:
             transformed_attributes, additional_attributes, transformed_features = batch
 
@@ -927,7 +942,7 @@ class DGTorch:
         return output
 
     def _get_gradient_penalty(self, generated_batch, real_batch, discriminator_func):
-        alpha = torch.rand(generated_batch[0].shape[0])
+        alpha = torch.rand(generated_batch[0].shape[0], device=self.device)
 
         interpolated_batch = [
             interpolate(g, r, alpha).requires_grad_(True)
@@ -939,7 +954,7 @@ class DGTorch:
         gradients = torch.autograd.grad(
             interpolated_output,
             interpolated_batch,
-            grad_outputs=torch.ones(interpolated_output.shape),
+            grad_outputs=torch.ones(interpolated_output.shape, device=self.device),
             retain_graph=True,
             create_graph=True,
         )
@@ -1106,6 +1121,8 @@ class DGTorch:
                 feature_noise = self.feature_noise_func(batch_size)
 
                 generated_batch = self.generator(attribute_noise, feature_noise)
+
+                real_batch = [x.to(self.device) for x in real_batch]
 
                 for index, b in enumerate(generated_batch):
                     if torch.isnan(b).any():
